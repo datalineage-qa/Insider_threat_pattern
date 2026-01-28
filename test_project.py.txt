@@ -1,0 +1,158 @@
+import os
+import time
+import pyotp
+import pytest
+import logging
+from datetime import datetime
+from pytest_bdd import scenarios, given, when, then, parsers
+from playwright.sync_api import sync_playwright
+
+# 1. Configuration and Constants
+LONG_TIMEOUT = 90000 
+scenarios("data_source/features/gmail.feature")
+
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] [%(name)s] - %(message)s')
+logger = logging.getLogger(__name__)
+
+# 2. Fixtures
+@pytest.fixture(scope="module")
+def pw_page():
+    with sync_playwright() as p:
+        # Implemented stealth arguments to bypass Google's bot detection
+        browser = p.chromium.launch(
+            headless=False, 
+            args=[
+                "--disable-blink-features",
+                "--disable-blink-features=AutomationControlled"
+            ]
+        )
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+            viewport={'width': 1440, 'height': 900}
+        )
+        page = context.new_page()
+        page.set_default_timeout(LONG_TIMEOUT)
+        yield page
+        browser.close()
+
+# --- STEP DEFINITIONS ---
+
+@given("gmail.com login credentials")
+def setup_creds():
+    # Store timestamp in pytest namespace for use across multiple steps
+    pytest.timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    pytest.unique_subject = f"test_email_upload_download_{pytest.timestamp}"
+    logger.info(f"Test subject: {pytest.unique_subject}")
+
+@when("login to gmail.com using stealth mode and 2FA")
+def login_logic(pw_page):
+    USER = os.getenv("GMAIL_USERNAME")
+    PASS = os.getenv("GMAIL_PASSWORD")
+    SECRET = os.getenv("GMAIL_2FA_SECRET")
+    
+    # Generate the TOTP token using the secret key provided in environment
+    totp = pyotp.TOTP(SECRET)
+    token = totp.now()
+
+    pw_page.goto("https://accounts.google.com/")
+    
+    # Email entry with human-like delay to avoid CAPTCHA
+    pw_page.type('input[type="email"]', USER, delay=150)
+    pw_page.keyboard.press("Enter")
+    
+    # Password entry
+    pw_page.wait_for_selector('input[type="password"]')
+    pw_page.type('input[type="password"]', PASS, delay=150)
+    pw_page.keyboard.press("Enter")
+    
+    # Handle the 2FA input field
+    time.sleep(4)
+    try:
+        pw_page.wait_for_selector('input[type="tel"]', timeout=10000) 
+        pw_page.type('input[type="tel"]', token, delay=100)
+        pw_page.keyboard.press("Enter")
+        logger.info(f"2FA token {token} submitted successfully.")
+    except Exception:
+        logger.info("2FA prompt not shown.")
+    
+    # Passive Redirect Check if landed on Google Account instead of Inbox
+    try:
+        pw_page.wait_for_selector('.T-I.T-I-KE.L3', timeout=20000) 
+    except:
+        if "myaccount.google.com" in pw_page.url:
+            logger.warning("Detected Google Account landing page. Forced navigating...")
+            pw_page.goto("https://mail.google.com/mail/u/0/#inbox")
+            pw_page.wait_for_selector('.T-I.T-I-KE.L3', timeout=20000)
+            time.sleep(5) 
+
+    logger.info("Logged into Gmail inbox")
+
+@when(parsers.parse('compose an email with a test attachment to "{recipient}"'))
+def compose_email(pw_page, recipient):
+    # Sends email to the account currently in use via environment variable
+    TARGET_EMAIL = os.getenv("GMAIL_USERNAME")
+    
+    # Generate dynamic filename with timestamp
+    unique_filename = f"test_file_{pytest.timestamp}.txt"
+    file_path = os.path.abspath(unique_filename)
+    
+    # Open Compose window
+    pw_page.wait_for_selector('.T-I.T-I-KE.L3', state="visible")
+    pw_page.get_by_role("button", name="Compose").click()
+    
+    # Fill recipient and subject
+    pw_page.wait_for_selector('input[role="combobox"]', timeout=15000)
+    time.sleep(2)
+    pw_page.fill('input[role="combobox"]', TARGET_EMAIL)
+    pw_page.keyboard.press("Enter")
+    pw_page.fill('input[name="subjectbox"]', pytest.unique_subject)
+
+    # Create the unique test file on the fly
+    with open(file_path, "w") as f:
+        f.write(f"Netskope QE Data Lineage Test - {pytest.timestamp}")
+        
+    # Attachment logic
+    with pw_page.expect_file_chooser() as fc_info:
+        pw_page.get_by_label("Attach files").click()
+    fc_info.value.set_files(file_path)
+    
+    # Wait for upload completion and send
+    pw_page.wait_for_selector('div[aria-label^="Remove attachment"]')
+    pw_page.get_by_role("button", name="Send").click()
+    logger.info(f"Email sent with attachment: {unique_filename}")
+
+    # CLEANUP: Delete the local file after it has been sent
+    if os.path.exists(file_path):
+        os.remove(file_path)
+        logger.info(f"Local file {unique_filename} deleted successfully.")
+
+@when("search for the sent email and verify it is visible in results")
+def search_and_verify_iterative(pw_page):
+    logger.info(f"Waiting for Gmail indexing: {pytest.unique_subject}")
+    time.sleep(20)
+    
+    # Perform precise search using the unique subject
+    search_query = f"subject:({pytest.unique_subject})"
+    pw_page.goto(f"https://mail.google.com/mail/u/0/#search/{search_query}")
+    
+    # Verify the specific email row exists in search results
+    try:
+        pw_page.wait_for_selector(f"span.bog:has-text('{pytest.unique_subject}')", timeout=30000)
+        logger.info("✅ Exact match confirmed in search results.")
+    except Exception:
+        pw_page.screenshot(path="search_fail.png")
+        raise Exception(f"Search failed for subject: {pytest.unique_subject}")
+
+    time.sleep(5) 
+
+@then("verify the email receipt is successful and logout")
+def verify_and_logout(pw_page):
+    logger.info("Initiating logout process...")
+    try:
+        pw_page.click('a[aria-label*="Google Account:"]')
+        pw_page.wait_for_selector('text=Sign out', timeout=15000)
+        pw_page.click('text=Sign out')
+        pw_page.wait_for_url("**/accounts.google.com/**")
+        logger.info("Successfully logged out.")
+    except Exception as e:
+        logger.error(f"Sign out failed: {e}")
